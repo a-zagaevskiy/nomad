@@ -867,7 +867,7 @@ func (c *Client) restoreState() error {
 		arConf := &allocrunner.Config{
 			Alloc:                 alloc,
 			Logger:                c.logger,
-			ClientConfig:          c.config,
+			ClientConfig:          c.configCopy,
 			StateDB:               c.stateDB,
 			StateUpdater:          c,
 			DeviceStatsReporter:   c,

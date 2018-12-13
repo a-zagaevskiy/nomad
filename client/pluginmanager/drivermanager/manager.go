@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
@@ -42,7 +41,7 @@ type StateStorage interface {
 
 // UpdateNodeDriverInfoFn is the callback used to update the node from
 // fingerprinting
-type UpdateNodeDriverInfoFn func(string, *structs.DriverInfo) *structs.Node
+type UpdateNodeDriverInfoFn func(string, *structs.DriverInfo)
 
 // StorePluginReattachFn is used to store plugin reattachment configurations.
 type StorePluginReattachFn func(*plugin.ReattachConfig) error
@@ -99,7 +98,7 @@ type manager struct {
 
 	// instances is the list of managed devices, access is serialized by instanceMu
 	instances   map[string]*instanceManager
-	instancesMu sync.Mutex
+	instancesMu sync.RWMutex
 
 	// reattachConfigs stores the plugin reattach configs
 	reattachConfigs    map[loader.PluginID]*shared.ReattachConfig
@@ -192,9 +191,6 @@ func (m *manager) Run() {
 
 	// signal ready
 	close(m.readyCh)
-
-	// wait for shutdown
-	<-m.ctx.Done()
 }
 
 // Shutdown cleans up all the plugins
@@ -202,8 +198,8 @@ func (m *manager) Shutdown() {
 	// Cancel the context to stop any requests
 	m.cancel()
 
-	m.instancesMu.Lock()
-	defer m.instancesMu.Unlock()
+	m.instancesMu.RLock()
+	defer m.instancesMu.RUnlock()
 
 	// Go through and shut everything down
 	for _, i := range m.instances {
@@ -211,28 +207,44 @@ func (m *manager) Shutdown() {
 	}
 }
 
-func (m *manager) Ready() <-chan struct{} {
-	ctx, cancel := context.WithTimeout(m.ctx, time.Second*10)
-	go func() {
-		defer cancel()
-		// We don't want to start initial fingerprint wait until Run loop has
-		// finished
-		select {
-		case <-m.readyCh:
-		case <-m.ctx.Done():
-			return
-		}
+func (m *manager) WaitForFirstFingerprint(ctx context.Context) <-chan struct{} {
+	ctx, cancel := context.WithCancel(ctx)
+	go m.waitForFirstFingerprint(ctx, cancel)
+	return ctx.Done()
+}
 
-		var availDrivers []string
-		for name, instance := range m.instances {
+func (m *manager) waitForFirstFingerprint(ctx context.Context, cancel context.CancelFunc) {
+	defer cancel()
+	// We don't want to start initial fingerprint wait until Run loop has
+	// finished
+	select {
+	case <-m.readyCh:
+	case <-ctx.Done():
+		// parent context canceled or timedout
+		return
+	case <-m.ctx.Done():
+		// shutdown called
+		return
+	}
+
+	var availDrivers []string
+	var wg sync.WaitGroup
+
+	// loop through instances and wait for each to finish initial fingerprint
+	m.instancesMu.RLock()
+	for n, i := range m.instances {
+		wg.Add(1)
+		go func(name string, instance *instanceManager) {
+			defer wg.Done()
 			instance.WaitForFirstFingerprint(ctx)
-			if instance.lastHealthState != drivers.HealthStateUndetected {
+			if instance.getLastHealth() != drivers.HealthStateUndetected {
 				availDrivers = append(availDrivers, name)
 			}
-		}
-		m.logger.Debug("detected drivers", "drivers", availDrivers)
-	}()
-	return ctx.Done()
+		}(n, i)
+	}
+	m.instancesMu.RUnlock()
+	wg.Wait()
+	m.logger.Debug("detected drivers", "drivers", availDrivers)
 }
 
 func (m *manager) loadReattachConfigs() error {
@@ -296,7 +308,7 @@ func (m *manager) fetchPluginReattachConfig(id loader.PluginID) (*plugin.Reattac
 }
 
 func (m *manager) RegisterEventHandler(driver, taskID string, handler EventHandler) {
-	m.instancesMu.Lock()
+	m.instancesMu.RLock()
 	if d, ok := m.instances[driver]; ok {
 		d.registerEventHandler(taskID, handler)
 	}
@@ -304,7 +316,7 @@ func (m *manager) RegisterEventHandler(driver, taskID string, handler EventHandl
 }
 
 func (m *manager) DeregisterEventHandler(driver, taskID string) {
-	m.instancesMu.Lock()
+	m.instancesMu.RLock()
 	if d, ok := m.instances[driver]; ok {
 		d.deregisterEventHandler(taskID)
 	}
@@ -312,8 +324,8 @@ func (m *manager) DeregisterEventHandler(driver, taskID string) {
 }
 
 func (m *manager) Dispense(d string) (drivers.DriverPlugin, error) {
-	m.instancesMu.Lock()
-	defer m.instancesMu.Unlock()
+	m.instancesMu.RLock()
+	defer m.instancesMu.RUnlock()
 	if instance, ok := m.instances[d]; ok {
 		return instance.dispense()
 	}

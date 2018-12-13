@@ -47,17 +47,14 @@ func (m *PluginGroup) RegisterAndRun(manager PluginManager) error {
 	}
 	m.managers = append(m.managers, manager)
 
-	go func() {
-		m.logger.Info("starting plugin manager", "plugin-type", manager.PluginType())
-		manager.Run()
-		m.logger.Info("plugin manager finished", "plugin-type", manager.PluginType())
-	}()
+	m.logger.Info("starting plugin manager", "plugin-type", manager.PluginType())
+	manager.Run()
 	return nil
 }
 
 // Ready returns a channel which will be closed once all plugin manangers are ready.
 // A timeout for waiting on each manager is given
-func (m *PluginGroup) Ready(ctx context.Context) (<-chan struct{}, error) {
+func (m *PluginGroup) WaitForFirstFingerprint(ctx context.Context) (<-chan struct{}, error) {
 	m.mLock.Lock()
 	defer m.mLock.Unlock()
 	if m.shutdown {
@@ -66,15 +63,20 @@ func (m *PluginGroup) Ready(ctx context.Context) (<-chan struct{}, error) {
 
 	var wg sync.WaitGroup
 	for i := range m.managers {
-		manager := m.managers[i]
+		manager, ok := m.managers[i].(FingerprintingPluginManager)
+		if !ok {
+			continue
+		}
+		logger := m.logger.With("plugin-type", manager.PluginType())
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			logger.Debug("waiting on plugin mananger initial fingerprint")
 			select {
-			case <-manager.Ready():
+			case <-manager.WaitForFirstFingerprint(ctx):
+				logger.Debug("finished plugin mananger initial fingerprint")
 			case <-ctx.Done():
-				m.logger.Warn("timeout waiting for plugin manager to be ready",
-					"plugin-type", manager.PluginType())
+				logger.Warn("timeout waiting for plugin manager to be ready")
 			}
 		}()
 	}
@@ -95,6 +97,7 @@ func (m *PluginGroup) Shutdown() {
 	for i := len(m.managers) - 1; i >= 0; i-- {
 		m.logger.Info("shutting down plugin manager", "plugin-type", m.managers[i].PluginType())
 		m.managers[i].Shutdown()
+		m.logger.Info("plugin manager finished", "plugin-type", m.managers[i].PluginType())
 	}
 	m.shutdown = true
 }
